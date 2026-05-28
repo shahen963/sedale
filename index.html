@@ -1,4 +1,4 @@
-!DOCTYPE html>
+<!DOCTYPE html>
 <html lang="ar" dir="rtl">
 <head>
     <meta charset="UTF-8">
@@ -181,13 +181,36 @@
         else { container.style.width = '100vw'; container.style.height = '100vh'; }
     }
 
+    // [SEC-FIX-BF] حماية من هجمات القوة الغاشمة على تسجيل الدخول
+    let _loginAttempts = 0;
+    let _loginLockUntil = 0;
+
     async function checkAuth() {
-        const email = document.getElementById('login-email').value;
-        const code = document.getElementById('login-code').value;
+        const _now = Date.now();
+        if (_now < _loginLockUntil) {
+            showToast("⛔ محظور مؤقتاً. انتظر " + Math.ceil((_loginLockUntil - _now) / 1000) + " ثانية");
+            return;
+        }
+        // [SEC-FIX-TRIM] تنظيف المدخلات من المسافات الزائدة
+        const email = document.getElementById('login-email').value.trim().toLowerCase();
+        const code = document.getElementById('login-code').value.trim();
+        if (!email || !code) { showToast("يرجى إدخال جميع البيانات"); return; }
         const { data } = await _sb.from('pharmacies').select('*').eq('email', email).eq('access_code', code).single();
-        if (data) { currentRes = data; localStorage.setItem('sh_ph_session', JSON.stringify(data)); startApp(); }
-        else alert("بيانات الدخول غير صحيحة");
+        if (data) {
+            _loginAttempts = 0;
+            currentRes = data;
+            // [SEC-FIX-SESSION] لا نخزّن access_code أو email في localStorage — بيانات حساسة
+            localStorage.setItem('sh_ph_session', JSON.stringify({ id: data.id, name: data.name }));
+            startApp();
+        } else {
+            _loginAttempts++;
+            if (_loginAttempts >= 5) { _loginLockUntil = Date.now() + 60000; _loginAttempts = 0; }
+            showToast("بيانات الدخول غير صحيحة ❌");
+        }
     }
+
+    // [FIX-INTERVAL] مرجع عالمي للمؤقت الرئيسي لمنع التكديس عند إعادة استدعاء startApp
+    let _mainRefreshInterval = null;
 
     function startApp() {
         const session = localStorage.getItem('sh_ph_session');
@@ -197,7 +220,9 @@
         document.getElementById('display-res-name').innerText = currentRes.name;
         loadOrders(true);
         loadHistory();
-        setInterval(() => {
+        // [FIX-INTERVAL] إيقاف أي مؤقت سابق قبل إنشاء مؤقت جديد
+        if (_mainRefreshInterval) clearInterval(_mainRefreshInterval);
+        _mainRefreshInterval = setInterval(() => {
             refreshTimer += 33.4;
             document.getElementById('sync-bar').style.width = refreshTimer + "%";
             if (refreshTimer >= 100) { refreshTimer = 0; loadOrders(); loadHistory(); }
@@ -207,20 +232,36 @@
     async function loadHistory() {
         if(!currentRes) return;
         const today = new Date(); today.setHours(0,0,0,0);
+        // [FIX-HISTORY] إضافة فلترة الأسبوع والشهر التي كانت مفقودة
+        const weekAgo = new Date(); weekAgo.setDate(weekAgo.getDate() - 7);
+        const monthAgo = new Date(); monthAgo.setDate(monthAgo.getDate() - 30);
         const { data: all } = await _sb.from('sh_public_orders').select('*').eq('pharmacy_id', currentRes.id).eq('status', 'completed_consultation');
         if(all) {
             historyOrders = all;
             const d = all.filter(o => new Date(o.created_at) >= today);
+            const w = all.filter(o => new Date(o.created_at) >= weekAgo);
+            const m = all.filter(o => new Date(o.created_at) >= monthAgo);
             const calcProfit = (list) => list.reduce((sum, o) => sum + (Number(o.delivery_price) || 0), 0);
             document.getElementById('today-profit').innerText = calcProfit(d).toLocaleString();
             document.getElementById('report-day').innerText = d.length;
             document.getElementById('p-day').innerText = calcProfit(d).toLocaleString();
+            // [FIX-HISTORY] تعبئة إحصائيات الأسبوع والشهر (كانت دائماً صفر)
+            document.getElementById('report-week').innerText = w.length;
+            document.getElementById('p-week').innerText = calcProfit(w).toLocaleString();
+            document.getElementById('report-month').innerText = m.length;
+            document.getElementById('p-month').innerText = calcProfit(m).toLocaleString();
         }
     }
 
     async function loadOrders(isFirst = false) {
         if (!currentRes) return;
-        const { data: orders } = await _sb.from('sh_public_orders').select('*').eq('res_type', 'pharmacy').in('status', ['searching', 'consulting', 'accepted']).order('created_at', { ascending: false });
+        // [SEC-FIX-FILTER] إضافة فلتر من جهة السيرفر لمنع جلب طلبات صيدليات أخرى
+        const { data: orders } = await _sb.from('sh_public_orders')
+            .select('*')
+            .eq('res_type', 'pharmacy')
+            .in('status', ['searching', 'consulting', 'accepted'])
+            .or(`pharmacy_id.eq.${currentRes.id},target_pharmacy.eq.${currentRes.name}`)
+            .order('created_at', { ascending: false });
         
         currentActiveOrders = (orders || []).filter(o => 
             (o.target_pharmacy === currentRes.name || Number(o.pharmacy_id) === Number(currentRes.id)) && 
@@ -237,10 +278,10 @@
         const list = document.getElementById('orders-list');
         if (orders.length === 0) { list.innerHTML = `<div class="empty-state"><i class="fas fa-check-circle"></i><p>الواجهة صافية.. لا توجد استشارات نشطة</p></div>`; return; }
         list.innerHTML = orders.map(o => `
-            <div class="order-card ${o.status === 'consulting' || o.status === 'accepted' ? 'status-active' : 'status-new'}" id="card-${o.id}">
-                <div style="font-size:9px; opacity:0.6;">#${String(o.id).slice(-4)}</div>
-                <div style="font-weight:bold; font-size:13px; margin:5px 0;">${o.customer_name || 'عميل'}</div>
-                <button class="btn-act ${o.status === 'consulting' || o.status === 'accepted' ? 'btn-follow' : 'btn-accept'}" onclick="openChat('${o.id}')">
+            <div class="order-card ${o.status === 'consulting' || o.status === 'accepted' ? 'status-active' : 'status-new'}" id="card-${escHtml(String(o.id))}">
+                <div style="font-size:9px; opacity:0.6;">#${escHtml(String(o.id).slice(-4))}</div>
+                <div style="font-weight:bold; font-size:13px; margin:5px 0;">${escHtml(o.customer_name || 'عميل')}</div>
+                <button class="btn-act ${o.status === 'consulting' || o.status === 'accepted' ? 'btn-follow' : 'btn-accept'}" onclick="openChat('${escHtml(String(o.id))}')">
                     ${o.status === 'consulting' || o.status === 'accepted' ? 'متابعة الاستشارة' : 'قبول الاستشارة'}
                 </button>
             </div>
@@ -284,7 +325,7 @@
                 scrollChat();
             })
             .subscribe((status) => {
-                console.log('[SHAHEN PH] channel status:', status);
+                // [SEC-FIX-LOG] console.log محذوف في الإنتاج
             });
 
         // تعديل: polling احتياطي كل 3 ثواني لضمان وصول الرسائل حتى لو الـ Realtime لم يشتغل
@@ -293,13 +334,16 @@
             if (!activeOrderId) { clearInterval(_msgPollInterval); return; }
             const { data: newMsgs } = await _sb.from('sh_messages').select('*').eq('order_id', activeOrderId).order('created_at', { ascending: true });
             if (newMsgs) {
+                // [FIX-SCROLL] تتبع صحيح للرسائل الجديدة بدلاً من m.id-1 الذي لا معنى له مع UUID
+                let _newMsgAdded = false;
                 newMsgs.forEach(m => {
                     if (msgIds.has(m.id)) return;
                     msgIds.add(m.id);
                     addMsgToUI(m.message, m.sender);
                     if (m.sender === 'client') { sound.play().catch(() => {}); showToast("رسالة جديدة من العميل 💬"); }
+                    _newMsgAdded = true;
                 });
-                if (newMsgs.some(m => !msgIds.has(m.id - 1))) scrollChat();
+                if (_newMsgAdded) scrollChat();
             }
         }, 3000);
     }
@@ -314,7 +358,7 @@
         // تعديل: إرسال order_id بنوعه الصحيح لدعم UUID والأرقام
         const { data: saved, error: msgErr } = await _sb.from('sh_messages').insert({ order_id: activeOrderId, sender: 'store', message: text }).select().single();
         if (msgErr) {
-            console.error('[SHAHEN PH sendMsg] فشل إرسال الرسالة:', msgErr);
+            // [SEC-FIX-LOG] console.error محذوف في الإنتاج
             showToast("فشل إرسال الرسالة ❌");
         }
         if (saved) msgIds.add(saved.id);
@@ -339,8 +383,16 @@
 
     function calculateTotal() {
         const text = document.getElementById('order-items-input').value;
-        const numbers = text.match(/\d+/g);
-        const total = numbers ? numbers.reduce((sum, num) => sum + parseInt(num), 0) : 0;
+        // [FIX-CALC] أخذ آخر رقم في كل سطر فقط (السعر)، لمنع جمع الكميات مع الأسعار
+        const lines = text.split('\n');
+        let total = 0;
+        lines.forEach(line => {
+            const nums = line.match(/\d+/g);
+            if (nums && nums.length > 0) {
+                // آخر رقم في السطر هو السعر
+                total += parseInt(nums[nums.length - 1]);
+            }
+        });
         document.getElementById('live-total-price').innerText = total.toLocaleString();
         return total;
     }
@@ -395,19 +447,36 @@
     }
 
     function openReportModal(period) {
+        const _today = new Date(); _today.setHours(0,0,0,0);
+        const _weekAgo = new Date(); _weekAgo.setDate(_weekAgo.getDate() - 7);
+        const _monthAgo = new Date(); _monthAgo.setDate(_monthAgo.getDate() - 30);
+        // [FIX-REPORT-1] تصفية السجلات حسب الفترة المطلوبة فعلاً (كان يعرض الكل دائماً)
+        let _filteredOrders = historyOrders;
+        let _reportTitle = 'الأرشيف الكامل';
+        if (period === 'day')   { _filteredOrders = historyOrders.filter(o => new Date(o.created_at) >= _today);   _reportTitle = 'تقرير اليوم'; }
+        else if (period === 'week')  { _filteredOrders = historyOrders.filter(o => new Date(o.created_at) >= _weekAgo);  _reportTitle = 'تقرير الأسبوع'; }
+        else if (period === 'month') { _filteredOrders = historyOrders.filter(o => new Date(o.created_at) >= _monthAgo); _reportTitle = 'تقرير الشهر'; }
+        document.getElementById('report-title').innerText = _reportTitle;
         const container = document.getElementById('report-items-container');
-        container.innerHTML = historyOrders.map(o => `
+        // [FIX-XSS-2] تشفير بيانات العملاء قبل إدراجها في innerHTML
+        container.innerHTML = _filteredOrders.map(o => `
             <div class="report-item" style="background: rgba(255,255,255,0.05); border-radius: 10px; padding: 10px; margin-bottom: 10px; border-right: 3px solid var(--gold);">
-                <b>${o.customer_name}</b><br>
-                <small>#${o.id} | ${new Date(o.created_at).toLocaleString('ar-SY')}</small>
-                <div style="font-size:10px; color:var(--gold); white-space:pre-line; margin-top:5px;">${o.order_details || ''}</div>
+                <b>${escHtml(o.customer_name || '---')}</b><br>
+                <small>#${escHtml(String(o.id))} | ${escHtml(new Date(o.created_at).toLocaleString('ar-SY'))}</small>
+                <div style="font-size:10px; color:var(--gold); white-space:pre-line; margin-top:5px;">${escHtml(o.order_details || '')}</div>
             </div>
         `).join('') || '<p style="text-align:center;">لا توجد بيانات</p>';
         document.getElementById('report-modal').style.display = 'flex';
     }
     function closeReportModal() { document.getElementById('report-modal').style.display = 'none'; }
     function showToast(m) { const t = document.getElementById('toast'); t.innerText = m; t.style.display = 'block'; setTimeout(() => t.style.display = 'none', 3000); }
-    function logout() { localStorage.removeItem('sh_ph_session'); location.reload(); }
+    function logout() {
+        // [FIX-LOGOUT] إيقاف المؤقت الرئيسي عند تسجيل الخروج لمنع استمرار الـ polling
+        if (_mainRefreshInterval) { clearInterval(_mainRefreshInterval); _mainRefreshInterval = null; }
+        if (_msgPollInterval) { clearInterval(_msgPollInterval); _msgPollInterval = null; }
+        localStorage.removeItem('sh_ph_session');
+        location.reload();
+    }
     window.onload = () => { if (localStorage.getItem('sh_ph_session')) startApp(); };
 </script>
 </body>
